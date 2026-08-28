@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib.util
+import json
 import sys
 import time
 import types
@@ -660,9 +661,11 @@ def test_a_corrupt_blob_never_breaks_the_poll():
 class _FakeResponse:
     def __init__(self, payload) -> None:
         self._payload = payload
+        self.status = 200
+        self.content_type = "application/json"
 
-    async def json(self):
-        return self._payload
+    async def text(self):
+        return json.dumps(self._payload)
 
     async def __aenter__(self):
         return self
@@ -672,12 +675,12 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    """aiohttp.ClientSession.get(), enough for async_get_devices."""
+    """aiohttp.ClientSession.request(), enough for async_get_devices."""
 
     def __init__(self, payload) -> None:
         self._payload = payload
 
-    def get(self, url, headers=None):
+    def request(self, method, url, **kwargs):
         return _FakeResponse(self._payload)
 
 
@@ -723,6 +726,25 @@ def test_a_device_record_without_connected_at_yields_empty_not_junk():
     )
 
     assert asyncio.run(client.async_get_devices())[0].connected_at == ""
+
+
+class _TransientPollingClient(_PollingClient):
+    async def async_get_properties(self, dsn: str) -> dict:
+        raise ac.CloudError("get properties failed (HTTP 504)", http_status=504)
+
+
+def test_transient_poll_failure_preserves_last_valid_coordinator_data():
+    client = _TransientPollingClient()
+    coord = _coord("DL-millcore", client=client)
+    last_valid = {"temperature": {"name": "temperature", "value": 92}}
+    coord.data = last_valid
+
+    with pytest.raises(coordinator.UpdateFailed) as exc_info:
+        asyncio.run(coord._async_update_data())
+
+    assert isinstance(exc_info.value.__cause__, ac.CloudError)
+    assert exc_info.value.__cause__.http_status == 504
+    assert coord.data is last_valid
 
 
 def test_last_connected_is_no_longer_wired_to_a_datapoint():

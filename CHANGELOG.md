@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.20] - 2026-08-28
+
+### Fixed
+- Normal `devices.json` and `properties.json` polling now uses the existing
+  bounded Ayla retry layer. Temporary `429`, `502`, `503`, and `504` responses
+  are handled before JSON decoding, including gateway responses served as
+  `text/plain` or HTML.
+- Transient aiohttp transport failures and runtime timeouts use the same two
+  retries with the existing 1.5-second linear backoff. Exhausted retries surface
+  as `CloudError`/`UpdateFailed` without replacing the coordinator's last valid
+  data or being misclassified as credential failures.
+- Internal transient failures and retry progress are logged at debug level, so
+  one cloud outage produces one final coordinator failure instead of a warning
+  for every attempt.
+
 ## [0.3.19] - 2026-08-22
 
 Everything here comes from one field diagnosis on the reference PrimaDonna Soul:

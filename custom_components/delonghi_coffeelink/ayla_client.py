@@ -112,10 +112,7 @@ class DelonghiAylaClient:
     ) -> None:
         msg = "%s %s -> HTTP %d (%.0fms)%s"
         args: tuple[Any, ...] = (method, url, status, elapsed_ms, detail)
-        if status >= 400:
-            _LOGGER.warning(msg, *args)
-        else:
-            _LOGGER.debug(msg, *args)
+        _LOGGER.debug(msg, *args)
 
     async def _request_json(
         self,
@@ -127,10 +124,11 @@ class DelonghiAylaClient:
         ok_status: frozenset[int] | set[int] | None = None,
         op: str = "",
     ) -> Any:
-        """HTTP request with transient retry (Eletta session paths only)."""
+        """HTTP request with authentication and transient retry."""
         await self.async_ensure_auth()
         if ok_status is None:
             ok_status = frozenset({200, 201})
+        operation = op or url.rsplit("/", 1)[-1]
         last_error: CloudError | None = None
         for attempt in range(CLOUD_HTTP_RETRY_COUNT + 1):
             started = time.monotonic()
@@ -150,12 +148,15 @@ class DelonghiAylaClient:
                         detail += f" value={self._value_hint(prop_val)}"
                     self._log_http(method, url, resp.status, elapsed_ms, detail=detail)
 
-                    if resp.status in CLOUD_TRANSIENT_HTTP_CODES and attempt < CLOUD_HTTP_RETRY_COUNT:
-                        _LOGGER.warning(
+                    if (
+                        resp.status in CLOUD_TRANSIENT_HTTP_CODES
+                        and attempt < CLOUD_HTTP_RETRY_COUNT
+                    ):
+                        _LOGGER.debug(
                             "Ayla transient HTTP %d on %s %s; retry %d/%d in %.1fs",
                             resp.status,
                             method,
-                            op or url.rsplit("/", 1)[-1],
+                            operation,
                             attempt + 1,
                             CLOUD_HTTP_RETRY_COUNT,
                             CLOUD_HTTP_RETRY_BACKOFF * (attempt + 1),
@@ -170,28 +171,44 @@ class DelonghiAylaClient:
                         )
 
                     if not text.strip():
-                        return None
-                    try:
-                        return json.loads(text)
-                    except json.JSONDecodeError as err:
-                        raise CloudError(
-                            f"{op or method}: expected JSON, got {resp.content_type!r}: "
-                            f"{text[:200]}",
-                            http_status=resp.status,
-                        ) from err
-            except aiohttp.ClientError as err:
+                        result = None
+                    else:
+                        try:
+                            result = json.loads(text)
+                        except json.JSONDecodeError as err:
+                            raise CloudError(
+                                f"{op or method}: expected JSON, "
+                                f"got {resp.content_type!r}: {text[:200]}",
+                                http_status=resp.status,
+                            ) from err
+                    if attempt:
+                        _LOGGER.debug(
+                            "Ayla %s %s succeeded after %d retr%s",
+                            method,
+                            operation,
+                            attempt,
+                            "y" if attempt == 1 else "ies",
+                        )
+                    return result
+            except (aiohttp.ClientError, TimeoutError) as err:
                 elapsed_ms = (time.monotonic() - started) * 1000
+                error_kind = (
+                    "timeout" if isinstance(err, TimeoutError) else "network error"
+                )
+                error_detail = f": {err}" if str(err) else ""
                 last_error = CloudError(
-                    f"{op or method} network error after {elapsed_ms:.0f}ms: {err}"
+                    f"{op or method} {error_kind} after {elapsed_ms:.0f}ms"
+                    f"{error_detail}"
                 )
                 if attempt < CLOUD_HTTP_RETRY_COUNT:
-                    _LOGGER.warning(
-                        "Ayla network error on %s %s; retry %d/%d: %s",
+                    _LOGGER.debug(
+                        "Ayla %s on %s %s; retry %d/%d%s",
+                        error_kind,
                         method,
-                        op or url.rsplit("/", 1)[-1],
+                        operation,
                         attempt + 1,
                         CLOUD_HTTP_RETRY_COUNT,
-                        err,
+                        error_detail,
                     )
                     await asyncio.sleep(CLOUD_HTTP_RETRY_BACKOFF * (attempt + 1))
                     continue
@@ -262,13 +279,25 @@ class DelonghiAylaClient:
 
     async def async_get_devices(self) -> list[AylaDevice]:
         """List all Ayla devices tied to this account."""
-        await self.async_ensure_auth()
         url = f"{AYLA_EU_ADS_URL}/apiv1/devices.json"
-        async with self._session.get(url, headers=self._auth_headers()) as resp:
-            data = await resp.json()
+        data = await self._request_json(
+            "GET",
+            url,
+            ok_status=frozenset({200}),
+            op="get devices",
+        )
+        if not isinstance(data, list):
+            raise CloudError(
+                f"get devices: expected a list, got {type(data).__name__}"
+            )
+
         devices: list[AylaDevice] = []
-        for wrap in data:
+        for index, wrap in enumerate(data):
+            if not isinstance(wrap, dict):
+                raise CloudError(f"get devices: item {index} is not an object")
             d = wrap.get("device", wrap)
+            if not isinstance(d, dict):
+                raise CloudError(f"get devices: item {index} has invalid device data")
             devices.append(
                 AylaDevice(
                     dsn=d.get("dsn", ""),
@@ -285,15 +314,32 @@ class DelonghiAylaClient:
 
     async def async_get_properties(self, dsn: str) -> dict[str, Any]:
         """Fetch all properties of a device, keyed by property name."""
-        await self.async_ensure_auth()
         url = f"{AYLA_EU_ADS_URL}/apiv1/dsns/{dsn}/properties.json"
-        async with self._session.get(url, headers=self._auth_headers()) as resp:
-            data = await resp.json()
+        data = await self._request_json(
+            "GET",
+            url,
+            ok_status=frozenset({200}),
+            op="get properties",
+        )
+        if not isinstance(data, list):
+            raise CloudError(
+                "get properties: expected a list, "
+                f"got {type(data).__name__}"
+            )
+
         props: dict[str, Any] = {}
-        for item in data:
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise CloudError(f"get properties: item {index} is not an object")
             p = item.get("property", {})
+            if not isinstance(p, dict):
+                raise CloudError(
+                    f"get properties: item {index} has invalid property data"
+                )
             name = p.get("name")
             if name:
+                if not isinstance(name, str):
+                    raise CloudError(f"get properties: item {index} has invalid name")
                 props[name] = p
         return props
 
@@ -338,7 +384,7 @@ class DelonghiAylaClient:
             "GET",
             url,
             ok_status=frozenset({200}),
-            op=f"get {property_name} dsn={dsn}",
+            op=f"get {property_name}",
         )
         prop = data.get("property")
         if not isinstance(prop, dict):
@@ -381,7 +427,7 @@ class DelonghiAylaClient:
             url,
             json_body={"datapoint": {"value": payload}},
             ok_status=frozenset({200, 201}),
-            op=f"set {connected_property} dsn={dsn}",
+            op=f"set {connected_property}",
         )
         return result or {}
 
