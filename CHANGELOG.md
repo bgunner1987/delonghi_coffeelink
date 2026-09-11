@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.21] - 2026-09-10
+
+### Fixed
+- Concurrent commands on cloud-session machines now share the existing
+  in-flight connect task. Additional callers join it before performing another
+  `app_id` read, so one machine/DSN cannot start parallel session connects and
+  duplicate requests no longer generate warning spam.
+- Button and service handlers wait for the tracked cold-connect operation
+  instead of returning immediately while it is still running. This prevents a
+  sequential caller from re-entering the connect path every few seconds.
+- A failed or timed-out session connect clears its task state and applies an
+  exponential 15-to-300-second retry backoff. Confirmation reads that keep
+  failing back off up to 30 seconds while remaining bounded by the overall
+  300-second confirmation deadline.
+- Integration unload now cancels and awaits an in-flight connect task, avoiding
+  orphaned tasks and unobserved cancellation exceptions.
+
 ## [0.3.20] - 2026-08-28
 
 ### Fixed
