@@ -15,6 +15,7 @@ import asyncio
 import base64
 import importlib.util
 import json
+import logging
 import sys
 import time
 import types
@@ -80,6 +81,13 @@ class _StubHomeAssistantError(Exception):
         self.translation_domain = translation_domain
         self.translation_key = translation_key
         self.translation_placeholders = translation_placeholders
+
+
+class _FakeHass:
+    """Home Assistant task creation used by the cloud-session path."""
+
+    def async_create_background_task(self, target, name):
+        return asyncio.create_task(target, name=name)
 
 
 def _install_stubs() -> None:
@@ -182,7 +190,7 @@ def _coord(oem_model: str, connection_status: str = "Online", client=None):
         connection_status=connection_status,
         connected_at="2026-08-12T04:01:46Z",
     )
-    coord = coordinator.DelonghiCoordinator(object(), client, device)
+    coord = coordinator.DelonghiCoordinator(_FakeHass(), client, device)
     coord.command_property = "data_request"
     return coord
 
@@ -326,6 +334,236 @@ def test_soul_command_bytes_are_unchanged():
     assert coord.profile.uses_cloud_session is False
     built = coord.profile.beverage_value(0x10, const.ACTION_START, None)
     assert base64.b64decode(built)[:12].hex(" ") == "0d 0d 83 f0 10 01 0f 00 fa 1b 01 06"
+
+
+# --- cloud-session single-flight and lifecycle ------------------------------
+
+
+class _SessionClient(_RecordingClient):
+    """Controllable Ayla session handshake for concurrency/lifecycle tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.post_calls = 0
+        self.property_reads = 0
+        self.fail_posts = 0
+        self.confirm_posts = True
+        self.block_confirmation = False
+        self.confirmation_cancelled = False
+        self.app_id = 0
+        self.post_started = asyncio.Event()
+        self.release_post = asyncio.Event()
+        self.release_post.set()
+
+    async def async_get_property_resilient(self, dsn: str, prop: str) -> dict:
+        self.property_reads += 1
+        if self.block_confirmation and self.post_calls:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.confirmation_cancelled = True
+                raise
+        return {"value": self.app_id}
+
+    async def async_post_cloud_session(
+        self, dsn: str, connected_property: str, app_id: int
+    ) -> None:
+        self.post_calls += 1
+        self.post_started.set()
+        await self.release_post.wait()
+        if self.fail_posts:
+            self.fail_posts -= 1
+            raise ac.CloudError("session POST failed", http_status=503)
+        if self.confirm_posts:
+            self.app_id = app_id
+
+
+def _session_coord(client: _SessionClient):
+    coord = _coord("DL-striker-cb", client=client)
+    coord.command_property = "app_data_request"
+    coord.connected_property = "app_device_connected"
+    coord.data = {const.APP_ID_PROPERTY: {"value": 0}}
+    return coord
+
+
+def test_two_nearly_simultaneous_requests_share_one_connect(monkeypatch):
+    monkeypatch.setattr(coordinator, "CONNECT_SETTLE_DELAY", 0)
+
+    async def _run() -> None:
+        client = _SessionClient()
+        client.release_post.clear()
+        coord = _session_coord(client)
+
+        first = asyncio.create_task(coord.async_send_wake())
+        await client.post_started.wait()
+        second = asyncio.create_task(coord.async_send_wake())
+        await asyncio.sleep(0)
+
+        assert client.post_calls == 1
+        assert not first.done()
+        assert not second.done()
+
+        client.release_post.set()
+        await asyncio.gather(first, second)
+
+        assert client.post_calls == 1
+        assert len(client.writes) == 1
+        assert coord._session_cold_task is None
+
+    asyncio.run(_run())
+
+
+def test_later_caller_joins_before_another_cloud_read(monkeypatch, caplog):
+    monkeypatch.setattr(coordinator, "CONNECT_SETTLE_DELAY", 0)
+    caplog.set_level(logging.DEBUG, logger=coordinator.__name__)
+
+    async def _run() -> None:
+        client = _SessionClient()
+        client.release_post.clear()
+        coord = _session_coord(client)
+
+        first = asyncio.create_task(coord.async_send_wake())
+        await client.post_started.wait()
+        reads_during_connect = client.property_reads
+        second = asyncio.create_task(coord.async_send_wake())
+        await asyncio.sleep(0)
+
+        assert client.post_calls == 1
+        assert client.property_reads == reads_during_connect
+        assert not second.done()
+        joined = [
+            record
+            for record in caplog.records
+            if "joining existing task" in record.getMessage()
+        ]
+        assert joined and all(record.levelno == logging.DEBUG for record in joined)
+
+        client.release_post.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(_run())
+
+
+def test_successful_connect_allows_a_later_new_connect(monkeypatch):
+    monkeypatch.setattr(coordinator, "CONNECT_SETTLE_DELAY", 0)
+
+    async def _run() -> None:
+        client = _SessionClient()
+        coord = _session_coord(client)
+
+        await coord.async_send_wake()
+        assert client.post_calls == 1
+        assert coord._session_cold_task is None
+
+        coord._last_connect_at = 0
+        coord._session_confirmed = False
+        coord.data = {const.APP_ID_PROPERTY: {"value": 0}}
+        client.app_id = 0
+        await coord.async_send_wake()
+
+        assert client.post_calls == 2
+        assert len(client.writes) == 2
+        assert coord._session_cold_task is None
+
+    asyncio.run(_run())
+
+
+def test_connect_exception_resets_in_progress_state(monkeypatch):
+    monkeypatch.setattr(coordinator, "CONNECT_SETTLE_DELAY", 0)
+
+    async def _run() -> None:
+        client = _SessionClient()
+        client.fail_posts = 1
+        coord = _session_coord(client)
+
+        await coord.async_send_wake()
+
+        assert client.post_calls == 1
+        assert client.writes == []
+        assert coord._session_cold_task is None
+        assert coord._session_connect_failures == 1
+        assert coord._session_retry_not_before > time.monotonic()
+
+    asyncio.run(_run())
+
+
+def test_connect_timeout_resets_in_progress_state(monkeypatch):
+    monkeypatch.setattr(coordinator, "CONNECT_SETTLE_DELAY", 0)
+    monkeypatch.setattr(coordinator, "CONNECT_CONFIRM_TIMEOUT", 0.01)
+
+    async def _run() -> None:
+        client = _SessionClient()
+        client.confirm_posts = False
+        client.block_confirmation = True
+        coord = _session_coord(client)
+
+        await coord.async_send_wake()
+
+        assert client.post_calls == 1
+        assert client.writes == []
+        assert client.confirmation_cancelled is True
+        assert coord._session_cold_task is None
+        assert coord._session_connect_failures == 1
+
+    asyncio.run(_run())
+
+
+def test_connect_retry_is_throttled_then_allowed(monkeypatch, caplog):
+    monkeypatch.setattr(coordinator, "CONNECT_SETTLE_DELAY", 0)
+    caplog.set_level(logging.DEBUG, logger=coordinator.__name__)
+
+    async def _run() -> None:
+        client = _SessionClient()
+        client.fail_posts = 1
+        coord = _session_coord(client)
+
+        await coord.async_send_wake()
+        retry_delay = coord._session_retry_not_before - time.monotonic()
+        assert retry_delay > 5
+
+        # A repeat at the former five-second cadence cannot POST again.
+        await coord.async_send_wake()
+        assert client.post_calls == 1
+        failure_warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and "Cloud session connect failed" in record.getMessage()
+        ]
+        assert len(failure_warnings) == 1
+
+        # Once the backoff expires, the same caller can establish a new session.
+        coord._session_retry_not_before = 0
+        await coord.async_send_wake()
+        assert client.post_calls == 2
+        assert len(client.writes) == 1
+        assert coord._session_connect_failures == 0
+
+    asyncio.run(_run())
+
+
+def test_shutdown_cancels_and_awaits_in_progress_connect(monkeypatch):
+    monkeypatch.setattr(coordinator, "CONNECT_SETTLE_DELAY", 0)
+
+    async def _run() -> None:
+        client = _SessionClient()
+        client.release_post.clear()
+        coord = _session_coord(client)
+
+        caller = asyncio.create_task(coord.async_send_wake())
+        await client.post_started.wait()
+        connect_task = coord._session_cold_task
+        assert connect_task is not None
+
+        await coord.async_shutdown()
+        result = await asyncio.gather(caller, return_exceptions=True)
+
+        assert connect_task.cancelled()
+        assert isinstance(result[0], asyncio.CancelledError)
+        assert coord._session_cold_task is None
+        assert coord._session_connect_failures == 0
+
+    asyncio.run(_run())
 
 
 # --- reachability preflight -------------------------------------------------
