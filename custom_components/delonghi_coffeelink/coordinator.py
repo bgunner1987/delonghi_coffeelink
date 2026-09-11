@@ -38,9 +38,12 @@ from .const import (
     ACTION_STOP,
     APP_ID_PROPERTY,
     COMMAND_PROPERTY_CANDIDATES,
+    CONNECT_CONFIRM_ERROR_BACKOFF_MAX,
     CONNECT_CONFIRM_POLL_INTERVAL,
     CONNECT_CONFIRM_TIMEOUT,
     CONNECT_REFRESH_INTERVAL,
+    CONNECT_RETRY_BACKOFF_INITIAL,
+    CONNECT_RETRY_BACKOFF_MAX,
     CONNECT_SETTLE_DELAY,
     CONNECTED_PROPERTY_CANDIDATES,
     DEFAULT_SCAN_INTERVAL,
@@ -101,6 +104,8 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._session_confirmed = False
         self._session_connect_lock = asyncio.Lock()
         self._session_cold_task: asyncio.Task[None] | None = None
+        self._session_connect_failures = 0
+        self._session_retry_not_before = 0.0
         if self.profile.uses_cloud_session:
             self._last_seen_app_id: int | None = None
         else:
@@ -139,10 +144,16 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_shutdown(self) -> None:
         """Cancel in-flight session work and reset session state on unload."""
-        if self._session_cold_task and not self._session_cold_task.done():
-            self._session_cold_task.cancel()
+        task = self._session_cold_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         self._session_cold_task = None
         self._last_connect_at = 0
+        self._reset_session_connect_backoff()
         if self._integration_app_id != self._own_app_id():
             self._integration_app_id = self._own_app_id()
         await super().async_shutdown()
@@ -353,8 +364,9 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # NOT register a session — that would block the official Coffee Link app
     # while HA is idle. After an HA command the machine keeps app_id for ~300 s
     # (protocol limit); Coffee Link may be temporarily blocked until timeout.
-    # Cold path runs in a background task so button/service handlers return
-    # immediately.
+    # The cold path is represented by one tracked task. Button/service handlers
+    # await that task, and concurrent callers join it instead of starting a
+    # second handshake or returning early into a retry loop.
     # ------------------------------------------------------------------ #
 
     @property
@@ -435,7 +447,7 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except CloudError as err:
             status = getattr(err, "http_status", None)
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Live app_id fetch failed for dsn=%s (http=%s): %s",
                 self.device.dsn,
                 status,
@@ -453,23 +465,32 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         that was never registered.
         """
         want = self._integration_app_id if want_app_id is None else want_app_id
-        started = time.time()
+        started = time.monotonic()
         last_progress = started
         poll_count = 0
         cloud_errors = 0
+        last_app_id: int | None = None
+        last_ok = False
         _LOGGER.debug(
             "Waiting for cloud session confirm on dsn=%s (timeout=%ds, want app_id=%d)",
             self.device.dsn,
             CONNECT_CONFIRM_TIMEOUT,
             want,
         )
-        while time.time() - started < CONNECT_CONFIRM_TIMEOUT:
+        while (remaining := CONNECT_CONFIRM_TIMEOUT - (time.monotonic() - started)) > 0:
             poll_count += 1
-            app_id, fetch_ok = await self._fetch_app_id_live()
+            try:
+                # Enforce the overall confirmation deadline even if the final
+                # resilient GET itself would otherwise run beyond it.
+                async with asyncio.timeout(remaining):
+                    app_id, fetch_ok = await self._fetch_app_id_live()
+            except TimeoutError:
+                break
+            last_app_id, last_ok = app_id, fetch_ok
             if not fetch_ok:
                 cloud_errors += 1
             elif app_id == want:
-                elapsed = time.time() - started
+                elapsed = time.monotonic() - started
                 self._session_confirmed = want == self._integration_app_id
                 _LOGGER.info(
                     "Cloud session confirmed app_id=%d (0x%08x) on dsn=%s after %.1fs "
@@ -482,8 +503,20 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     cloud_errors,
                 )
                 return True
-            await asyncio.sleep(CONNECT_CONFIRM_POLL_INTERVAL)
-            now = time.time()
+            delay = CONNECT_CONFIRM_POLL_INTERVAL
+            if not fetch_ok:
+                # _request_json() already retries an individual GET. If all of
+                # those attempts fail, back off the *next* confirmation poll as
+                # well instead of hammering Ayla at a fixed cadence.
+                delay = min(
+                    CONNECT_CONFIRM_POLL_INTERVAL * 2 ** min(cloud_errors, 10),
+                    CONNECT_CONFIRM_ERROR_BACKOFF_MAX,
+                )
+            remaining = CONNECT_CONFIRM_TIMEOUT - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(delay, remaining))
+            now = time.monotonic()
             if now - last_progress >= 15:
                 _LOGGER.debug(
                     "Still waiting for cloud session confirm on dsn=%s (%.0fs/%ds, "
@@ -497,8 +530,7 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     cloud_errors,
                 )
                 last_progress = now
-        last_app_id, last_ok = await self._fetch_app_id_live()
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Connect POST sent but app_id not confirmed after %ds on dsn=%s "
             "(last app_id=%s, want=%d, polls=%d, cloud_errors=%d)",
             CONNECT_CONFIRM_TIMEOUT,
@@ -510,6 +542,43 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._session_confirmed = False
         return False
+
+    def _reset_session_connect_backoff(self) -> None:
+        """Clear failure throttling after a successful or explicit reset."""
+        self._session_connect_failures = 0
+        self._session_retry_not_before = 0.0
+
+    def _record_session_connect_failure(self, reason: str, *, exc_info: bool = False) -> None:
+        """Throttle later cold-connect attempts after a real failure."""
+        self._session_connect_failures += 1
+        exponent = min(self._session_connect_failures - 1, 10)
+        delay = min(
+            CONNECT_RETRY_BACKOFF_INITIAL * 2**exponent,
+            CONNECT_RETRY_BACKOFF_MAX,
+        )
+        self._session_retry_not_before = time.monotonic() + delay
+        _LOGGER.warning(
+            "%s for dsn=%s; another connect may be attempted in %.0fs",
+            reason,
+            self.device.dsn,
+            delay,
+            exc_info=exc_info,
+        )
+
+    async def _join_session_cold_task(self) -> bool:
+        """Wait for the one in-flight connect/command task, if present."""
+        task = self._session_cold_task
+        if task is None or task.done():
+            return False
+        _LOGGER.debug(
+            "Cloud session connect already in progress for dsn=%s; "
+            "joining existing task",
+            self.device.dsn,
+        )
+        # One cancelled service/button caller must not cancel the shared
+        # machine-level connect. Unload cancels the tracked task explicitly.
+        await asyncio.shield(task)
+        return True
 
     def _update_session_from_props(self, props: dict[str, Any]) -> None:
         """Parse app_id from poll data; must never break the poll."""
@@ -617,55 +686,73 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _cold_connect_then(
         self, send_fn: Callable[[], Awaitable[None]]
     ) -> None:
+        current_task = asyncio.current_task()
         try:
-            # The lock serializes concurrent cold connects: the first task does
-            # the POST + settle, the ones queued behind it find the session
-            # fresh and go straight to their send. No command is ever dropped.
-            async with self._session_connect_lock:
-                if not self._session_is_fresh(None):
-                    app_id = await self._read_app_id(live=True)
-                    self._revert_foreign_app_id_if_session_clear(app_id)
-                    _LOGGER.debug(
-                        "Cold cloud session connect starting dsn=%s (app_id before=%s)",
-                        self.device.dsn,
-                        app_id,
-                    )
-                    posted_app_id = await self._post_cloud_session()
-                    await asyncio.sleep(CONNECT_SETTLE_DELAY)
-                    if not await self._wait_for_session_confirmed(posted_app_id):
-                        return
-                    self._last_connect_at = time.time()
-                elif not self._session_confirmed:
-                    app_id, fetch_ok = await self._fetch_app_id_live()
-                    if not fetch_ok or app_id != self._integration_app_id:
-                        _LOGGER.warning(
-                            "Warm session cache but app_id=%s (fetch_ok=%s) != %d on dsn=%s; "
-                            "skipping command",
-                            app_id,
-                            fetch_ok,
-                            self._integration_app_id,
+            try:
+                # The task is the primary single-flight guard. Keep the lock as
+                # a second invariant around the actual machine/DSN handshake so
+                # even a future direct caller cannot create parallel POSTs.
+                async with self._session_connect_lock:
+                    if not self._session_is_fresh(None):
+                        app_id = await self._read_app_id(live=True)
+                        self._revert_foreign_app_id_if_session_clear(app_id)
+                        _LOGGER.debug(
+                            "Cold cloud session connect starting dsn=%s "
+                            "(app_id before=%s)",
                             self.device.dsn,
+                            app_id,
                         )
-                        return
+                        posted_app_id = await self._post_cloud_session()
+                        await asyncio.sleep(CONNECT_SETTLE_DELAY)
+                        if not await self._wait_for_session_confirmed(posted_app_id):
+                            self._record_session_connect_failure(
+                                f"Cloud session connect timed out after "
+                                f"{CONNECT_CONFIRM_TIMEOUT}s"
+                            )
+                            return
+                        self._last_connect_at = time.time()
+                    elif not self._session_confirmed:
+                        app_id, fetch_ok = await self._fetch_app_id_live()
+                        if not fetch_ok or app_id != self._integration_app_id:
+                            self._record_session_connect_failure(
+                                "Warm cloud session could not be confirmed"
+                            )
+                            return
+            except Exception:  # noqa: BLE001 - never send after connect failure
+                self._record_session_connect_failure(
+                    "Cloud session connect failed", exc_info=True
+                )
+                return
+
+            self._reset_session_connect_backoff()
             # The session handshake can take minutes (CONNECT_CONFIRM_TIMEOUT),
             # so the reachability checked when the command was queued may no
             # longer hold. Re-check at the point of writing.
             self._ensure_machine_reachable()
             await send_fn()
-        except Exception:  # noqa: BLE001 - strict: do not send after connect failure
+        except Exception:  # noqa: BLE001 - background command errors are surfaced in logs
             _LOGGER.warning(
-                "Cold cloud session connect failed for dsn=%s; command not sent",
+                "Command failed after cloud session connect for dsn=%s",
                 self.device.dsn,
                 exc_info=True,
             )
         finally:
-            self._session_cold_task = None
+            if self._session_cold_task is current_task:
+                self._session_cold_task = None
 
     async def _with_cloud_session(
         self, send_fn: Callable[[], Awaitable[None]]
     ) -> None:
         if not self.profile.uses_cloud_session or not self.connected_property:
             await send_fn()
+            return
+
+        # This check intentionally precedes _read_app_id(): duplicate callers
+        # used to perform another resilient cloud GET before discovering the
+        # active task, which made an external repeat loop show up roughly at the
+        # HTTP retry cadence. Waiting here also keeps sequential service callers
+        # inside the original operation instead of immediately trying again.
+        if await self._join_session_cold_task():
             return
 
         app_id = await self._read_app_id()
@@ -686,20 +773,27 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             self._integration_app_id = app_id
             self._last_connect_at = time.time()
+            self._reset_session_connect_backoff()
             await send_fn()
             return
 
         if self._session_is_fresh(app_id):
             _LOGGER.debug("Cloud session warm cache hit for dsn=%s", self.device.dsn)
+            self._reset_session_connect_backoff()
             await send_fn()
             return
 
-        if self._session_cold_task and not self._session_cold_task.done():
-            _LOGGER.warning(
-                "Cloud session connect already in progress for dsn=%s; "
-                "ignoring duplicate command (confirm timeout=%ds)",
+        # A task may have been created while _read_app_id() yielded.
+        if await self._join_session_cold_task():
+            return
+
+        retry_in = self._session_retry_not_before - time.monotonic()
+        if retry_in > 0:
+            _LOGGER.debug(
+                "Cloud session connect backoff active for dsn=%s; "
+                "next attempt in %.1fs",
                 self.device.dsn,
-                CONNECT_CONFIRM_TIMEOUT,
+                retry_in,
             )
             return
 
@@ -708,12 +802,12 @@ class DelonghiCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.device.dsn,
             CONNECT_CONFIRM_TIMEOUT,
         )
-        # Each command gets its own task; the connect lock serializes them, so
-        # commands pressed during a cold connect are queued, not dropped.
-        self._session_cold_task = self.hass.async_create_background_task(
+        task = self.hass.async_create_background_task(
             self._cold_connect_then(send_fn),
             "delonghi cloud session cold connect",
         )
+        self._session_cold_task = task
+        await asyncio.shield(task)
 
     # ------------------------------------------------------------------ #
     # Command sniffer

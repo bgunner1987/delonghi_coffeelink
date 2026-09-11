@@ -40,6 +40,9 @@ CONNECT_REFRESH_INTERVAL = 240  # refresh before 4*60s (device timeout ~300s)
 CONNECT_SETTLE_DELAY = 4  # sleep after POST connect (background tasks only)
 CONNECT_CONFIRM_TIMEOUT = 300  # poll app_id after POST (Eletta; can exceed 180s on bad cloud days)
 CONNECT_CONFIRM_POLL_INTERVAL = 1  # seconds between app_id polls during confirm
+CONNECT_CONFIRM_ERROR_BACKOFF_MAX = 30  # cap failed app_id poll backoff
+CONNECT_RETRY_BACKOFF_INITIAL = 15  # first new session attempt after a real failure
+CONNECT_RETRY_BACKOFF_MAX = 300  # cap repeated session-connect failures
 
 # Ayla HTTP resilience (502/503/504 gateway timeouts seen on ads-eu.aylanetworks.com).
 CLOUD_HTTP_RETRY_COUNT = 2
